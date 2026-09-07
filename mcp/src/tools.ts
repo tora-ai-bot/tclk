@@ -20,7 +20,9 @@ import {
   generateHashLock,
   generatePointLock,
   makeAccept,
+  makeHeartbeat,
   makeOffer,
+  normalizeRailId,
   schnorrAdaptor,
   stateNote,
   transcriptRecord,
@@ -111,7 +113,7 @@ export interface PostFrameInput {
   line: string;
   did?: string;
   sig?: string;
-  nonce?: number;
+  nonce?: number | string;
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -198,14 +200,14 @@ export function createHandlers(options: HandlerOptions = {}) {
     // ── Thin frame builders ──────────────────────────────────────────────────
 
     tclk_make_lock(input: { from: string; contract: string; rail: string; ref: string; presig?: PresigRef }) {
-      return built({ type: "lock", ...input });
+      return built({ type: "lock", ...input, rail: normalizeRailId(input.rail) });
     },
 
-    tclk_make_reveal(input: { from: string; contract: string; secret: string }) {
+    tclk_make_reveal(input: { from: string; contract: string; ref: string; secret: string }) {
       return built({ type: "reveal", ...input });
     },
 
-    tclk_make_refund(input: { from: string; contract: string; reason?: string }) {
+    tclk_make_refund(input: { from: string; contract: string; ref: string; reason?: string }) {
       return built({ type: "refund", ...input });
     },
 
@@ -220,7 +222,20 @@ export function createHandlers(options: HandlerOptions = {}) {
       rail?: string;
       ref?: string;
     }) {
-      return built({ type: "receipt", ...input });
+      return built({
+        type: "receipt",
+        ...input,
+        rail: input.rail === undefined ? undefined : normalizeRailId(input.rail),
+      });
+    },
+
+    tclk_make_heartbeat(input: {
+      from: string;
+      contract: string;
+      nonce?: string;
+      note?: string;
+    }) {
+      return built(makeHeartbeat(input));
     },
 
     // ── Transcript ───────────────────────────────────────────────────────────
@@ -362,6 +377,14 @@ export function createHandlers(options: HandlerOptions = {}) {
         fail("pass all three of `did`, `sig` and `nonce`, or none of them");
       }
 
+      if (input.nonce !== undefined) {
+        const isSafe = typeof input.nonce === "number" && Number.isSafeInteger(input.nonce) && input.nonce >= 0;
+        const isDecimal = typeof input.nonce === "string" && /^[0-9]{1,19}$/.test(input.nonce);
+        if (!isSafe && !isDecimal) {
+          fail("`nonce` must be a non-negative safe integer or a 1-19 decimal digit string");
+        }
+      }
+
       if (supplied === 3) {
         const response = await client.postSigned(input.room, {
           did: input.did!,
@@ -411,11 +434,39 @@ export function createHandlers(options: HandlerOptions = {}) {
       }
 
       const view = await client.readRoom(input.room, input.since);
-      const records = view.messages.map((message) => transcriptRecord(input.room, message));
+      // Normalize each message on its own. A room is world-writable, so one message with a
+      // malformed envelope (a `nonce` that is not decimal text, a non-string `from`) must
+      // not throw the whole read: that would let a single hostile line deny every reader
+      // the rest of the room. A record that will not normalize becomes a `malformed` entry
+      // carrying its seq and the reason, exactly as a fold reports a bad line, so the seq
+      // stays visible and auditable instead of vanishing.
+      //
+      // The `full` export above deliberately keeps the opposite rule, and the difference is
+      // what the two things claim rather than which is stricter. An export claims to be the
+      // complete history: a partial one is indistinguishable from a whole one, so a reader
+      // who audits from it would conclude something about a deal from a transcript with a
+      // hole in it, and `parseTranscriptExport` refuses the file instead. A window claims
+      // only a bounded view and already reports `lastSeq`, so a caller knows it is holding
+      // a slice; naming the seq it could not read leaves that slice honest. Handing back
+      // silently fewer records than the venue served is the one thing neither may do.
+      const records: TranscriptRecord[] = [];
+      const malformed: { seq: number | null; reason: string }[] = [];
+      for (const message of view.messages) {
+        try {
+          records.push(transcriptRecord(input.room, message));
+        } catch (error) {
+          const seq =
+            message !== null && typeof message === "object" && Number.isSafeInteger((message as { seq?: unknown }).seq)
+              ? ((message as { seq: number }).seq)
+              : null;
+          malformed.push({ seq, reason: errorMessage(error).replace(/^tclk: /, "") });
+        }
+      }
       return {
         room: input.room,
         source: "window" as const,
         records,
+        malformed,
         count: records.length,
         lastSeq: view.last_seq,
       };

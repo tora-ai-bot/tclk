@@ -14,7 +14,9 @@ import {
   hashLockFromPreimage,
   openContract,
   type AcceptFrame,
+  type LockFrame,
   type OfferFrame,
+  type RefundFrame,
   type RevealFrame,
 } from "../src/index.js";
 
@@ -39,6 +41,10 @@ describe("examples/htlc-walkthrough.md", () => {
     const locked = applyFrame(accepted.state, decodeFrame(lockLine), offer.expiresMs);
     expect(locked.ok).toBe(true);
     expect(locked.state.status).toBe("locked");
+    // reveal/refund name the same rail reference the lock announced (SPEC §3: ref must equal lock.ref).
+    const lockRef = (decodeFrame(lockLine) as LockFrame).ref;
+    expect((decodeFrame(revealLine) as RevealFrame).ref).toBe(lockRef);
+    expect((decodeFrame(refundLine) as RefundFrame).ref).toBe(lockRef);
 
     const claimed = applyFrame(locked.state, decodeFrame(revealLine), offer.refundAfterMs - 1);
     expect(claimed.ok).toBe(true);

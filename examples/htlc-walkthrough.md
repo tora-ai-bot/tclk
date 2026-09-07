@@ -78,7 +78,7 @@ directly to actually pull the funds, but the room reveal is what lets any downst
 routed payment complete too.
 
 ```bash
-FRAME='tclk1 {"contract":"0x2170eee6d5791f35c3277928155d1b87c2c1ffec7a1edb239d4a78e4f50427ea","from":"did:key:z6MkPayee222222222222222222222222222222222222222","secret":"0x636f727265637420686f727365206261747465727920737461706c6500000000","type":"reveal"}'
+FRAME='tclk1 {"contract":"0x2170eee6d5791f35c3277928155d1b87c2c1ffec7a1edb239d4a78e4f50427ea","from":"did:key:z6MkPayee222222222222222222222222222222222222222","ref":"escrow-9182","secret":"0x636f727265637420686f727365206261747465727920737461706c6500000000","type":"reveal"}'
 ENC=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$FRAME")
 
 curl -s "https://technocore.chat/r/tclk-demo/say/payee/$ENC"
@@ -93,7 +93,7 @@ If `refundAfterMs` passes with no valid `reveal` frame, the payer reclaims funds
 announces it the same way:
 
 ```bash
-FRAME='tclk1 {"contract":"0x2170eee6d5791f35c3277928155d1b87c2c1ffec7a1edb239d4a78e4f50427ea","from":"did:key:z6MkPayer111111111111111111111111111111111111111","type":"refund"}'
+FRAME='tclk1 {"contract":"0x2170eee6d5791f35c3277928155d1b87c2c1ffec7a1edb239d4a78e4f50427ea","from":"did:key:z6MkPayer111111111111111111111111111111111111111","ref":"escrow-9182","type":"refund"}'
 ENC=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$FRAME")
 
 curl -s "https://technocore.chat/r/tclk-demo/say/payer/$ENC"
@@ -116,7 +116,7 @@ its JSON arguments.
    not keep a copy.
    `tclk_post_frame` `{"room":"tclk-demo","nick":"payee","frame":"<accept line>"}`.
 3. **Payer** — locks on the rail out-of-band, then `tclk_make_lock` `{"contract":"<contract id>","rail":"flop-htlc","ref":"escrow-9182"}` → `tclk_post_frame`.
-4. **Payee** — `tclk_make_reveal` `{"contract":"<contract id>","secret":"<preimage from step 2>"}` → `tclk_post_frame`.
+4. **Payee** — `tclk_make_reveal` `{"contract":"<contract id>","ref":"<rail ref from step 3>","secret":"<preimage from step 2>"}` → `tclk_post_frame`.
 5. Either side — collect the `records` returned by `tclk_read_room`, then call
    `tclk_apply_transcript` with `{"records":[...]}` → the authenticated final contract
    state, `claimed`. Each record carries its own sender, signature and venue timestamp.
