@@ -130,6 +130,8 @@ is not permitted in a frame.** It is the one code point neither rule escapes —
 escaping stops at U+001F and the non-ASCII rule starts at U+0080 — so it would reach the wire
 raw, which §2's ASCII-only requirement forbids: technocore sweeps it to a space before storing,
 leaving a stored line that is not the line the sender signed.
+`tests/canonical-escapes.test.ts` pins each form separately and, in one composite vector, all of
+them at once against a frozen wire line and offer id.
 
 Common field shapes:
 
