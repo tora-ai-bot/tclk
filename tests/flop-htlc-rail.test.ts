@@ -24,7 +24,9 @@ import {
   makeAccept,
   makeOffer,
   openContract,
+  type FlopChainClient,
   type FlopChainHead,
+  type FlopHtlcRecord,
   type LockTerms,
 } from "../src/index.js";
 
@@ -71,6 +73,32 @@ function terms(
 function setup(chainOptions: ConstructorParameters<typeof MockFlopChain>[0] = {}) {
   const chain = new MockFlopChain({ genesisMs: T0, ...chainOptions });
   return { chain, rail: new FlopHtlcRail(chain) };
+}
+
+/**
+ * An injected, read-only chain client: fixed heads, and fixed escrows served under whatever
+ * ids the test hands it. It mints nothing and parses nothing — the string that reaches
+ * `getHtlc` is looked up as-is and recorded in `asked`. Writes throw; nothing here needs them.
+ */
+function readOnlyChain(escrows: ReadonlyMap<string, FlopHtlcRecord>, head: FlopChainHead) {
+  const asked: string[] = [];
+  const write = async (): Promise<never> => {
+    throw new Error("read-only test client");
+  };
+  const client: FlopChainClient = {
+    bestHead: async () => ({ ...head }),
+    finalizedHead: async () => ({ ...head }),
+    params: async () => ({ ...FLOP_HTLC_PARAMS_V050 }),
+    getHtlc: async (id) => {
+      asked.push(id);
+      const held = escrows.get(id);
+      return held === undefined ? null : { ...held };
+    },
+    createHtlc: write,
+    redeemHtlc: write,
+    refundHtlc: write,
+  };
+  return { client, asked };
 }
 
 describe("flop-htlc rail — lifecycle on the mock chain", () => {
@@ -262,6 +290,49 @@ describe("flop-htlc rail — verifyLock is the payee's gate", () => {
     const ref = await rail.lock(deal.terms);
     chain.getHtlc = async () => { throw new Error("rpc down"); };
     expect(await rail.verifyLock(deal.terms, ref)).toBe(false);
+  });
+
+  it("reads ref as an opaque id: a flop-rail-tx-… ref and a full 0x ref get identical verdicts", async () => {
+    // Live lock frames carry both shapes (reported on #171). SPEC §3.3 leaves the lock `ref`
+    // rail-specific and validateFrame requires only a non-empty string, so neither the rail nor
+    // a later RPC adapter behind getHtlc(id) may read a prefix or a length into it.
+    const deal = terms();
+    const txRef = "flop-rail-tx-5f1d0c8a2b7e4396"; // suffix illustrative; only the shape matters
+    const contractRef = deal.terms.contract; // the exact full 0x<contract> id
+    expect(contractRef).toMatch(/^0x[0-9a-f]{64}$/);
+
+    const tip = { number: 100, timestampMs: T0 + 100_000 };
+    // The escrow `lock` creates for these terms at block 0 (T_lock 7200), which at block 100
+    // still leaves exactly the R10.2 room.
+    const live: Omit<FlopHtlcRecord, "id"> = {
+      payer: PAYER_DID, payee: PAYEE_DID, amount: "1000000", asset: "FLOP",
+      hash: deal.terms.statement, timelockBlock: 7200, createdBlock: 0, status: "created",
+    };
+    const cases: Array<[string, Omit<FlopHtlcRecord, "id">, boolean]> = [
+      ["matching escrow", live, true],
+      ["wrong amount", { ...live, amount: "999999" }, false],
+      ["wrong hashlock", { ...live, hash: generateHashLock().hash }, false],
+      ["expired: T_lock already reached at the tip", { ...live, timelockBlock: tip.number }, false],
+    ];
+    for (const [name, body, expected] of cases) {
+      // One client, the same escrow under both ids; only `id` differs.
+      const { client, asked } = readOnlyChain(
+        new Map<string, FlopHtlcRecord>([
+          [txRef, { ...body, id: txRef }],
+          [contractRef, { ...body, id: contractRef }],
+        ]),
+        tip,
+      );
+      const rail = new FlopHtlcRail(client);
+      const verdicts = [
+        await rail.verifyLock(deal.terms, txRef),
+        await rail.verifyLock(deal.terms, contractRef),
+      ];
+      expect(verdicts, name).toEqual([expected, expected]);
+      // The client was asked for these two strings and nothing else: no prefix stripped,
+      // nothing re-cased, cut, or derived from the ref.
+      expect(new Set(asked), name).toEqual(new Set([txRef, contractRef]));
+    }
   });
 });
 
