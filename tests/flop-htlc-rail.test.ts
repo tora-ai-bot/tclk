@@ -3,8 +3,8 @@
  *
  * Nothing here touches a network or a key. What is worth testing is that the rail enforces
  * the yellow paper §10 predicates in the chain's own time domain (block height, finalized
- * head for refund), maps tclk's ms deadlines onto it without a fail-open hole, and refuses
- * to vouch for an escrow that does not leave the payee the R10.2 room.
+ * head for redeem and refund), maps tclk's ms deadlines onto it without a fail-open hole,
+ * and refuses to vouch for an escrow that does not leave the payee the R10.2 room.
  */
 
 import { describe, it, expect } from "vitest";
@@ -99,6 +99,28 @@ function readOnlyChain(escrows: ReadonlyMap<string, FlopHtlcRecord>, head: FlopC
     refundHtlc: write,
   };
   return { client, asked };
+}
+
+type LockedDeal = ReturnType<typeof terms> & { ref: string };
+
+/** Lock `n` fresh deals on `rail` at the chain's current height, each with its escrow ref. */
+async function lockDeals(rail: FlopHtlcRail, n: number): Promise<LockedDeal[]> {
+  const deals: LockedDeal[] = [];
+  for (let i = 0; i < n; i++) {
+    const deal = terms();
+    deals.push({ ...deal, ref: await rail.lock(deal.terms) });
+  }
+  return deals;
+}
+
+/** "ok" when `op` resolves, otherwise the message it rejected with. */
+async function outcome(op: () => Promise<unknown>): Promise<string> {
+  try {
+    await op();
+    return "ok";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 describe("flop-htlc rail — lifecycle on the mock chain", () => {
@@ -211,21 +233,24 @@ describe("flop-htlc rail — lifecycle on the mock chain", () => {
     expect(await rail.status(ref)).toBe("settled");
   });
 
-  it("holds the claim / refund boundary at T_lock: claim is < T_lock, refund is >= T_lock", async () => {
-    // Two escrows so each side of the boundary is exercised from the same height.
+  it("holds the claim / refund boundary at T_lock on the finalized head: claim < T_lock, refund >= T_lock", async () => {
+    // Two escrows so each side of the boundary is exercised from the same height. Finality
+    // follows the tip here; the stalled-finality cases are in the R2.2 block below.
     const { chain, rail } = setup();
     const a = terms();
     const b = terms();
     const refA = await rail.lock(a.terms);
     const refB = await rail.lock(b.terms);
 
-    chain.mine(7199); // best == T_lock - 1
+    chain.mine(7199); // finalized == best == T_lock - 1
+    expect((await chain.finalizedHead()).number).toBe(7199);
     await expect(rail.refund(refA)).rejects.toThrow(/before T_lock/);
     await rail.claim(refA, a.secret);
     expect(await rail.status(refA)).toBe("settled");
 
-    chain.mine(1); // best == T_lock
-    await expect(rail.claim(refB, b.secret)).rejects.toThrow(/claim at\/after T_lock/);
+    chain.mine(1); // finalized == best == T_lock
+    expect((await chain.finalizedHead()).number).toBe(7200);
+    await expect(rail.claim(refB, b.secret)).rejects.toThrow(/claim at\/after T_lock on the finalized head/);
     await rail.refund(refB);
     expect(await rail.status(refB)).toBe("refunded");
   });
@@ -239,6 +264,95 @@ describe("flop-htlc rail — lifecycle on the mock chain", () => {
     expect(await rail.verifyLock(deal.terms, "flop-htlc-mock-999")).toBe(false);
     expect(await rail.verifyLock(deal.terms, "")).toBe(false);
     expect(await rail.status("flop-htlc-mock-999")).toBeUndefined();
+  });
+});
+
+describe("flop-htlc rail — a finality stall freezes the claim deadline too (R2.2, §1.2 / §13 F1)", () => {
+  it("the #171 review case: T_lock 7200, best 7200, finalized 7190 — claim stays open until T_lock is finalized", async () => {
+    // Redeem releases funds, so like refund it reads the finalized prefix, never the tip
+    // (R2.2), and a finality stall freezes its deadline with the refund's (§1.2, §13 F1).
+    // A tip-clocked claim is refused here while the refund is refused too.
+    const { chain, rail } = setup();
+    const [a, b, c, d, e, f, g] = await lockDeals(rail, 7);
+    for (const deal of [a, b, c, d, e, f, g]) {
+      expect((await chain.getHtlc(deal.ref))?.timelockBlock).toBe(7200); // T_lock
+    }
+    // One claim through the rail, one redeem straight on the mock chain: both must admit it.
+    const claimOnBoth = async (viaRail: LockedDeal, viaChain: LockedDeal) => {
+      await rail.claim(viaRail.ref, viaRail.secret);
+      await chain.redeemHtlc(viaChain.ref, viaChain.secret);
+      expect([await rail.status(viaRail.ref), await rail.status(viaChain.ref)]).toEqual(["settled", "settled"]);
+    };
+
+    chain.mine(7190); // finality follows the tip up to 7190 ...
+    chain.holdFinality = true;
+    chain.mine(10); // ... then stalls while the tip reaches T_lock
+    expect((await chain.bestHead()).number).toBe(7200);
+    expect((await chain.finalizedHead()).number).toBe(7190);
+    await expect(rail.refund(a.ref)).rejects.toThrow(/refund before T_lock is finalized/);
+    await claimOnBoth(a, b);
+
+    chain.mine(1800); // the tip runs on, 1800 blocks past T_lock; finality still at 7190
+    expect((await chain.bestHead()).number).toBe(9000);
+    await expect(rail.refund(c.ref)).rejects.toThrow(/refund before T_lock is finalized/);
+    await claimOnBoth(c, d);
+
+    chain.finalize(7199); // finalized == T_lock - 1: still the claim side
+    await expect(rail.refund(e.ref)).rejects.toThrow(/refund before T_lock is finalized/);
+    await claimOnBoth(e, f);
+
+    chain.finalize(7200); // finalized == T_lock: the claim side closes, the refund side opens
+    await expect(rail.claim(g.ref, g.secret)).rejects.toThrow(
+      /claim at\/after T_lock on the finalized head \(finalized 7200, T_lock 7200\)/,
+    );
+    await expect(chain.redeemHtlc(g.ref, g.secret)).rejects.toThrow(/redeem_htlc at\/after T_lock on the finalized head/);
+    expect(await rail.status(g.ref)).toBe("created");
+    await rail.refund(g.ref);
+    expect(await rail.status(g.ref)).toBe("refunded");
+
+    // Never both (R10.1): the settled escrows do not refund, the refunded one does not settle.
+    for (const deal of [a, b, c, d, e, f]) {
+      await expect(rail.refund(deal.ref)).rejects.toThrow(/refund on a settled escrow/);
+    }
+    await expect(rail.claim(g.ref, g.secret)).rejects.toThrow(/claim on a refunded escrow/);
+  });
+
+  it("R10.1 under R2.2: at every finalized height exactly one of redeem/refund is admissible, wherever the tip is", async () => {
+    const { chain, rail } = setup();
+    // [best, finalized], in chain order. Every escrow is locked at block 0, so T_lock = 7200.
+    const steps: Array<[number, number]> = [
+      [7190, 7190], [7200, 7190], [7201, 7190], [9000, 7190], [9000, 7199], [9000, 7200], [9000, 9000],
+    ];
+    // Four fresh escrows per step, one per gate, so no attempt consumes another's escrow.
+    const deals = await lockDeals(rail, steps.length * 4);
+    chain.holdFinality = true;
+    for (const [i, [best, finalized]] of steps.entries()) {
+      chain.mine(best - (await chain.bestHead()).number);
+      chain.finalize(finalized);
+      const [toClaim, toRedeem, toRefund, toChainRefund] = deals.slice(i * 4, i * 4 + 4);
+      const got = {
+        railClaim: await outcome(() => rail.claim(toClaim.ref, toClaim.secret)),
+        chainRedeem: await outcome(() => chain.redeemHtlc(toRedeem.ref, toRedeem.secret)),
+        railRefund: await outcome(() => rail.refund(toRefund.ref)),
+        chainRefund: await outcome(() => chain.refundHtlc(toChainRefund.ref)),
+      };
+      const at = `best ${best}, finalized ${finalized}`;
+      if (finalized < 7200) {
+        expect(got, at).toEqual({
+          railClaim: "ok",
+          chainRedeem: "ok",
+          railRefund: expect.stringMatching(/refund before T_lock is finalized/),
+          chainRefund: expect.stringMatching(/refund_htlc before T_lock is finalized/),
+        });
+      } else {
+        expect(got, at).toEqual({
+          railClaim: expect.stringMatching(/claim at\/after T_lock on the finalized head/),
+          chainRedeem: expect.stringMatching(/redeem_htlc at\/after T_lock on the finalized head/),
+          railRefund: "ok",
+          chainRefund: "ok",
+        });
+      }
+    }
   });
 });
 

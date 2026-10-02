@@ -12,9 +12,13 @@
 //   one; that disagreement is flagged in the PR, not papered over here).
 // - Deadlines: tclk speaks unix ms, the chain speaks block height with 1 s blocks (§1, §2).
 //   `T_lock = best.number + ceil((refundAfterMs - best.timestampMs) / 1000)`, computed from
-//   the tip the moment the escrow is created. Redeem is admitted strictly below `T_lock` at
-//   the tip; refund at/after `T_lock` on the *finalized* head (R10.3) — the same `<` / `>=`
-//   pair `MemoryRail` uses on `refundAfterMs`.
+//   the tip the moment the escrow is created (admission). After that, both fund-releasing
+//   actions read the *finalized* head, never the tip (R2.2: every fund-releasing action reads
+//   `FinalizedPrefix`; §1.2 / §13 F1: a finality stall freezes economic deadlines; R10.3 for
+//   refund): redeem is admitted while `finalized.number < T_lock`, refund once
+//   `finalized.number >= T_lock` — the same `<` / `>=` pair `MemoryRail` uses on
+//   `refundAfterMs`. One clock decides both, so at any finalized height exactly one of them
+//   is admissible (R10.1's "at most one", with no height at which neither is).
 // - Admission (R10.2 timelock symmetry): with `T_other` = blocks until `claimByMs`, the
 //   escrow's timelock must satisfy
 //   `T_FLOP >= T_other + max(ceil(T_other * p / 100), max_finality_stall + current_finality_lag)`.
@@ -205,9 +209,17 @@ export class FlopHtlcRail implements SettlementRail {
 
   async claim(ref: string, secret: string): Promise<void> {
     const record = await this.requireCreated(ref, "claim");
-    const best = await this.chain.bestHead();
-    if (!isValidHead(best)) throw new Error("tclk: chain head is not a usable block reference");
-    if (best.number >= record.timelockBlock) throw new Error("tclk: claim at/after T_lock");
+    // R2.2: a redeem releases funds, so it reads the finalized head like refund does, never
+    // the tip. A finality stall then freezes the claim deadline instead of letting the tip
+    // run it out while the refund is still frozen (§1.2, §13 F1).
+    const finalized = await this.chain.finalizedHead();
+    if (!isValidHead(finalized)) throw new Error("tclk: chain head is not a usable block reference");
+    if (finalized.number >= record.timelockBlock) {
+      throw new Error(
+        `tclk: claim at/after T_lock on the finalized head ` +
+          `(finalized ${finalized.number}, T_lock ${record.timelockBlock})`,
+      );
+    }
     if (!verifySecret("hash", record.hash, secret)) {
       throw new Error("tclk: secret does not open the statement");
     }

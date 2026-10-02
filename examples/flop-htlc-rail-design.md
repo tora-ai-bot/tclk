@@ -13,8 +13,10 @@ what a live client must do.
 The chain side is the yellow paper, v0.5.0 draft, updated 2026-09-05
 (<https://flop.finance/intro/yellowpaper/>): §10 *HTLC Atomic Swap*, Appendix A parameters,
 Appendix G.3 (`has-station`: `create_htlc` / `redeem_htlc` / `refund_htlc`), Appendix H.5
-(status: "LIVE local mechanics; pair conformance GAP — PENDING E.48"). Every assumption below
-cites where it comes from; the ones that are assumptions rather than citations are marked.
+(status: "LIVE local mechanics; pair conformance GAP — PENDING E.48"). R2.2, §1.2 and §13 F1 are
+quoted from the 2026-09-24 sync of the same draft (`flop-labs/yellowpaper` @ `3c97bbc`). Every
+assumption below cites where it comes from; the ones that are assumptions rather than citations
+are marked.
 
 ## What maps to what
 
@@ -27,8 +29,8 @@ cites where it comes from; the ones that are assumptions rather than citations a
 | `refundAfterMs` | `T_lock` (block height) | YP §1/§2: 1-second blocks; mapping below |
 | `claimByMs` | `T_other` for the R10.2 admission check | YP §10 R10.2 |
 | `lock()` → ref | `create_htlc` → escrow id | YP App. G.3 |
-| `claim(ref, secret)` | `redeem_htlc(id, s)`, tip strictly below `T_lock` | YP §10 state machine |
-| `refund(ref)` | `refund_htlc(id)`, **finalized** head at/after `T_lock` | YP §10 R10.3 |
+| `claim(ref, secret)` | `redeem_htlc(id, s)`, **finalized** head strictly below `T_lock` | YP §10 state machine; R2.2; §1.2 / §13 F1 |
+| `refund(ref)` | `refund_htlc(id)`, **finalized** head at/after `T_lock` | YP §10 R10.3; R2.2 |
 
 ## Time domains
 
@@ -45,14 +47,28 @@ with the header — standard Substrate). The projection is done once, when the e
 after that the escrow's `T_lock` is the truth and the ms deadline is only used to re-derive
 `T_other` for `verifyLock`.
 
-Claim/refund boundaries are the same pair `MemoryRail` and `PaperRail` use on `refundAfterMs`:
-claim admitted while `best.number < T_lock`, refund admitted once `finalized.number >= T_lock`.
-The refund gate reads the finalized head and never the tip (R10.3: "a tip-gated refund is
-reorg-unsafe"). `MockFlopChain.holdFinality` simulates a finality stall so that gate is tested.
+Claim/refund boundaries are the same pair `MemoryRail` and `PaperRail` use on `refundAfterMs`,
+and both read the finalized head: claim admitted while `finalized.number < T_lock`, refund
+admitted once `finalized.number >= T_lock`. Neither gate reads the tip. R2.2: "Every
+fund-releasing, expiry, slashing, or pruning action MUST read the finalized prefix ... never the
+chain tip" — a redeem releases the escrow to the payee as surely as a refund returns it to the
+payer — and R10.3 says it again for refund ("a tip-gated refund is reorg-unsafe"). One clock for
+both means exactly one of claim/refund is admissible at any finalized height: R10.1's "at most
+one", with no height at which neither is. `MockFlopChain.holdFinality` simulates a finality stall
+so both gates are tested against it.
 
 If block production stalls, `T_lock` arrives later in wall time than `refundAfterMs`. That
 delays the payer's refund and never shortens the payee's claim window, which is the safe
 direction; the reverse (blocks faster than 1 s) is not something BABE does.
+
+If finality stalls while blocks keep coming (§13 F1: "production continues; finality-sensitive
+economic deadlines freeze"), the tip can pass `T_lock` before the finalized head reaches it. Both
+deadlines then freeze, as §1.2 requires ("a finality stall MUST freeze economic deadlines by
+construction"): the payee can still claim and the payer cannot refund yet, until the finalized
+prefix reaches `T_lock`. A tip-clocked claim gets this wrong: at `T_lock = 7200`, `best = 7200`,
+`finalized = 7190` it refuses the claim while the refund is still refused, so the claim deadline
+runs out on the tip during the stall. That was this binding's first revision (caught in review on
+PR #171); the tests now pin the case, for the rail and for the mock chain.
 
 ## R10.2 — timelock symmetry, made checkable
 
@@ -67,7 +83,7 @@ party that knows both, so it does:
 
 - `T_other` = blocks from the tip until `claimByMs` — the coordination leg is the "foreign"
   duration here: the payee reveals in the room by `claimByMs` and then needs the redeem
-  included before `T_lock`.
+  included before the finalized head reaches `T_lock`.
 - `T_FLOP` = blocks from the tip until `refundAfterMs` (= `T_lock - best.number`).
 - `current_finality_lag` = `best.number - finalized.number`, derived, never a separate reading.
 - `p` and `max_finality_stall` come from `FlopChainClient.params()`. The library ships the
@@ -124,7 +140,8 @@ Each method carries a `TODO(testnet RPC)` comment. In one place:
    payer's wallet; return the escrow id from the emitted event.
 4. `getHtlc`: storage read by id → `FlopHtlcRecord`.
 5. `redeemHtlc` / `refundHtlc`: the corresponding extrinsics signed by payee / payer; the
-   rail has already checked the height gates, the chain checks them again.
+   rail has already checked the height gates against the finalized head, the chain checks
+   them again.
 
 Until a public node exists, every method throws `not wired`, and `FlopHtlcRail` on top of it
 fails closed (tests cover this).

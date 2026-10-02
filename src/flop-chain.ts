@@ -10,8 +10,8 @@
 //
 // - `MockFlopChain` — in-memory, deterministic, block-stepped. It enforces the §10 state
 //   machine (CREATED → SETTLED | REFUNDED, at most one of redeem/refund, hash check,
-//   height timelock, refund gated on the *finalized* head) so the rail and its tests can
-//   be driven end to end with no network. It holds no value.
+//   height timelock, redeem and refund both gated on the *finalized* head — R2.2, R10.3)
+//   so the rail and its tests can be driven end to end with no network. It holds no value.
 // - `FlopRpcChainClient` — a stub that documents the method surface and throws. There is
 //   no public FLOP RPC to bind to as of this writing; wiring it is a follow-up that will
 //   also have to decide where signing happens (not here: this interface carries no keys).
@@ -62,7 +62,10 @@ export interface FlopHtlcRecord {
   asset: string;
   /** `H = SHA256(s)`, 0x-hex, 32 bytes. */
   hash: string;
-  /** `T_lock`: redeem is admitted strictly below this height; refund at/after it. */
+  /**
+   * `T_lock`: redeem is admitted while the *finalized* head is strictly below this height,
+   * refund once the finalized head is at/after it (R2.2, R10.3). The tip decides neither.
+   */
   timelockBlock: number;
   /** Height at which the escrow was created. */
   createdBlock: number;
@@ -85,9 +88,15 @@ export interface FlopCreateHtlc {
  * "not done" and never advances its own view on one.
  */
 export interface FlopChainClient {
-  /** The best (tip) block. Only ever used to admit a redeem. */
+  /**
+   * The best (tip) block. Read only for admission (the R10.2 projection in `lock` /
+   * `verifyLock`), never to release funds (R2.2).
+   */
   bestHead(): Promise<FlopChainHead>;
-  /** The AlephBFT-finalized head. R10.3: a refund is gated on this, never on the tip. */
+  /**
+   * The AlephBFT-finalized head. R2.2 / R10.3: redeem and refund are both gated on this,
+   * never on the tip, so a finality stall freezes both deadlines (§1.2, §13 F1).
+   */
   finalizedHead(): Promise<FlopChainHead>;
   /** Chain parameters for the R10.2 admission check. */
   params(): Promise<FlopHtlcParams>;
@@ -138,12 +147,14 @@ export function isValidParams(params: unknown): params is FlopHtlcParams {
 /**
  * Deterministic in-memory FLOP chain: one escrow map and two heads. Blocks are 1 s apart
  * (yellow paper §1, §2). `mine(n)` advances the tip; finality follows unless `holdFinality`
- * is set, which is how a finality stall is simulated for the R10.3 refund gate.
+ * is set, which is how a finality stall is simulated for the finalized-head gates.
  *
  * It enforces what the pallet enforces (§10 R10.1): create only with a well-formed hash,
  * a positive amount and a timelock in the future; redeem only from `created`, only with
- * `SHA256(s) == H`, only strictly below `T_lock` at the tip; refund only from `created`,
- * only once the finalized head reaches `T_lock`. Every violation throws.
+ * `SHA256(s) == H`, only while the finalized head is strictly below `T_lock`; refund only
+ * from `created`, only once the finalized head reaches `T_lock`. Both releases read the
+ * finalized head, never the tip (R2.2, R10.3), so a finality stall freezes the redeem
+ * deadline together with the refund (§1.2, §13 F1). Every violation throws.
  */
 export class MockFlopChain implements FlopChainClient {
   private best: number;
@@ -234,7 +245,11 @@ export class MockFlopChain implements FlopChainClient {
 
   async redeemHtlc(id: string, preimage: string): Promise<void> {
     const held = this.requireCreated(id, "redeem_htlc");
-    if (this.best >= held.timelockBlock) throw new Error("tclk: redeem_htlc at/after T_lock");
+    // R2.2: a fund-releasing action reads the finalized head, never the tip. While finality
+    // stalls the tip may pass T_lock; the redeem deadline stays frozen with the refund's.
+    if (this.finalized >= held.timelockBlock) {
+      throw new Error("tclk: redeem_htlc at/after T_lock on the finalized head");
+    }
     if (!isHex(preimage) || preimage.length !== 66) {
       throw new Error("tclk: redeem_htlc preimage must be 32 bytes of 0x-hex");
     }
@@ -307,7 +322,8 @@ export class FlopRpcChainClient implements FlopChainClient {
   async getHtlc(_id: string): Promise<FlopHtlcRecord | null> {
     return this.unwired("getHtlc");
   }
-  // TODO(testnet RPC): submit has-station.redeem_htlc(id, s) signed by the payee's wallet.
+  // TODO(testnet RPC): submit has-station.redeem_htlc(id, s) signed by the payee's wallet,
+  // only while finalizedHead().number < T_lock (R2.2).
   async redeemHtlc(_id: string, _preimage: string): Promise<void> {
     return this.unwired("redeemHtlc");
   }
