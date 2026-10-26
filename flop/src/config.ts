@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { checkSymmetryParams, type FlopSymmetryParams } from "./symmetry.js";
 export type FlopNetwork = "devnet" | "testnet" | "mainnet";
 export interface FlopRailConfig {
   network?: FlopNetwork;
@@ -10,13 +9,6 @@ export interface FlopRailConfig {
   blockTimeMs?: number;
   /** Extra blocks before refund; also bounds lock-inclusion delay. */
   refundMarginBlocks?: number;
-  /**
-   * Opt-in R10.2 admission check (the finality-open gate, then the timelock-symmetry
-   * margin), with all three values read from the live runtime. No default: absent, no
-   * check runs. A testnet-only approximation (claimByMs stands in for the counter-chain
-   * duration), not mainnet conformance.
-   */
-  symmetry?: FlopSymmetryParams;
 }
 export interface ResolvedFlopConfig {
   network: FlopNetwork;
@@ -24,8 +16,6 @@ export interface ResolvedFlopConfig {
   expectedGenesisHash?: string;
   blockTimeMs: number;
   refundMarginBlocks: number;
-  /** Present only when configured. */
-  symmetry?: Readonly<FlopSymmetryParams>;
 }
 export const HEX32 = /^0x[0-9a-f]{64}$/;
 export function resolveFlopConfig(
@@ -68,17 +58,11 @@ export function resolveFlopConfig(
       throw new Error(`flop: invalid ${field}`);
     }
   }
-  // Exact fields: a misspelt parameter must not leave the check half-configured.
-  const symmetry =
-    input.symmetry === undefined
-      ? undefined
-      : checkSymmetryParams(input.symmetry);
   return Object.freeze({
     network,
     rpcUrl,
     expectedGenesisHash: input.expectedGenesisHash,
     blockTimeMs,
     refundMarginBlocks,
-    ...(symmetry ? { symmetry } : {}),
   });
 }

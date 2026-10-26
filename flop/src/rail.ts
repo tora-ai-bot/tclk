@@ -16,6 +16,7 @@ import {
   type FlopNetwork,
 } from "./config.js";
 import {
+  checkSymmetryParams,
   checkTimelockSymmetry,
   toOneSecondBlocks,
   type FlopSymmetryParams,
@@ -40,6 +41,20 @@ export interface FlopSnapshot {
   finalizedNumber: number;
   escrow?: FlopEscrow;
 }
+/**
+ * What R10.2 reads in the block that evaluates an admission: that block's height, the
+ * runtime's AlephFinalizedPrefix as read in it, and that block's runtime constants.
+ * `current_finality_lag` is `number - finalizedNumber`.
+ */
+export interface FlopAdmissionBlock {
+  genesis: string;
+  hash: string;
+  number: number;
+  /** Runtime's AlephFinalizedPrefix, read in this same block. */
+  finalizedNumber: number;
+  /** The R10.2 constants of this block's runtime. */
+  params: FlopSymmetryParams;
+}
 export interface FlopOpenRequest {
   payee: string;
   amount: string;
@@ -50,18 +65,26 @@ export interface FlopOpenRequest {
 export interface FlopChain {
   readonly account?: string;
   snapshot(escrowId?: string, at?: string): Promise<FlopSnapshot>;
+  /**
+   * R10.2 inputs read in one block. Without `height`: the best block, which a new open
+   * builds on; it need not be final, and FlopRail only ever refuses on it. With `height`:
+   * the canonical finalized block at that height (an escrow's createdBlock).
+   */
+  admissionBlock(height?: number): Promise<FlopAdmissionBlock>;
   open(request: FlopOpenRequest): Promise<string>;
   satisfy(escrowId: string, preimages: readonly string[]): Promise<void>;
   refund(escrowId: string): Promise<void>;
 }
 interface Reference {
-  v: 1;
+  v: 2;
   network: FlopNetwork;
   genesis: string;
   escrow: string;
   anchor: string;
   blockTimeMs: number;
   refundMarginBlocks: number;
+  /** The R10.2 constants the open was admitted under; the binding commits the policy to them. */
+  symmetry: FlopSymmetryParams;
   terms: LockTerms;
 }
 const encoder = new TextEncoder();
@@ -127,12 +150,12 @@ function validateTerms(terms: LockTerms): void {
   }
 }
 function encodeRef(ref: Reference): string {
-  return `flop1.${base64urlnopad.encode(encoder.encode(canonicalJson(ref)))}`;
+  return `flop2.${base64urlnopad.encode(encoder.encode(canonicalJson(ref)))}`;
 }
 function parseRef(value: string): Reference {
   if (
     typeof value !== "string" ||
-    !value.startsWith("flop1.") ||
+    !value.startsWith("flop2.") ||
     value.length > 3500
   )
     throw new Error("flop: malformed reference");
@@ -143,7 +166,7 @@ function parseRef(value: string): Reference {
   );
   if (
     !ref ||
-    ref.v !== 1 ||
+    ref.v !== 2 ||
     canonicalJson(Object.keys(ref).sort()) !==
       canonicalJson([
         "anchor",
@@ -152,6 +175,7 @@ function parseRef(value: string): Reference {
         "genesis",
         "network",
         "refundMarginBlocks",
+        "symmetry",
         "terms",
         "v",
       ]) ||
@@ -163,9 +187,10 @@ function parseRef(value: string): Reference {
     throw new Error("flop: malformed reference");
   }
   validateTerms(ref.terms);
+  checkSymmetryParams(ref.symmetry);
   return ref;
 }
-/** Public 32-byte witness binds ALL terms and chain/time configuration into the policy. */
+/** Public 32-byte witness binds ALL terms, chain/time configuration and R10.2 parameters into the policy. */
 function binding(ref: Reference): string {
   const { escrow: _escrow, ...rest } = ref;
   return digest(
@@ -191,26 +216,49 @@ function duration(ref: Reference, anchor: FlopSnapshot): number {
   return blocks;
 }
 /**
- * Opt-in R10.2 admission check, derived from the finalized anchor alone so the payer's
- * lock and the payee's verifyLock reach the same verdict. The finality-open gate runs
- * first, then the relation. T_FLOP is the relative timeout submitted to the pallet;
- * T_other is the anchor-to-claimByMs span in one-second blocks, as R10.2 converts it,
- * whatever blockTimeMs is; current_finality_lag is the anchor height minus its runtime
- * finality prefix. Testnet-only approximation: tclk has no counter-chain leg, so
- * claimByMs stands in for T_other, and this claims no mainnet R10.2 conformance (see
- * README).
+ * R10.2 in one admitting block: the finality-open gate, then the symmetry relation, under
+ * the parameters the reference binds, which must be that block's own runtime constants.
+ * current_finality_lag is the block's height minus the runtime finality prefix read in it.
+ * T_FLOP is the relative timeout submitted to the pallet. T_other is the anchor-to-claimByMs
+ * span in one-second blocks, whatever blockTimeMs is: tclk has no counter-chain leg, so the
+ * payee's claim deadline stands in for the foreign duration (the README lists what else is
+ * approximate).
  */
-function checkSymmetry(
+function admit(
   ref: Reference,
   anchor: FlopSnapshot,
-  params: FlopSymmetryParams,
+  block: FlopAdmissionBlock,
 ): void {
+  if (canonicalJson(block.params) !== canonicalJson(ref.symmetry))
+    throw new Error(
+      "flop: R10.2 parameters differ from the admitting block's runtime constants",
+    );
   checkTimelockSymmetry({
     tFlopBlocks: duration(ref, anchor),
     tOtherBlocks: toOneSecondBlocks(ref.terms.claimByMs - anchor.timestampMs),
-    currentFinalityLagBlocks: anchor.number - anchor.finalizedNumber,
-    params,
+    currentFinalityLagBlocks: block.number - block.finalizedNumber,
+    params: ref.symmetry,
   });
+}
+function checkAdmissionBlock(b: FlopAdmissionBlock): FlopAdmissionBlock {
+  if (
+    !HEX32.test(b.genesis) ||
+    !HEX32.test(b.hash) ||
+    !Number.isSafeInteger(b.number) ||
+    b.number < 0 ||
+    b.number > 0xffffffff ||
+    !Number.isSafeInteger(b.finalizedNumber) ||
+    b.finalizedNumber < 0 ||
+    b.finalizedNumber > b.number
+  )
+    throw new Error("flop: malformed admission block");
+  return {
+    genesis: b.genesis,
+    hash: b.hash,
+    number: b.number,
+    finalizedNumber: b.finalizedNumber,
+    params: checkSymmetryParams(b.params),
+  };
 }
 function checkSnapshot(s: FlopSnapshot): void {
   if (
@@ -291,6 +339,26 @@ export class FlopRail implements SettlementRail {
       throw new Error("flop: genesis mismatch");
     return s;
   }
+  /**
+   * The block R10.2 is evaluated in: before submitting, the best block the open will build
+   * on; for an existing escrow, its createdBlock, read from finalized state.
+   */
+  private async admissionBlock(
+    anchor: FlopSnapshot,
+    height?: number,
+  ): Promise<FlopAdmissionBlock> {
+    const block = checkAdmissionBlock(await this.chain.admissionBlock(height));
+    if (
+      block.genesis !== anchor.genesis ||
+      (height === undefined
+        ? block.number < anchor.number
+        : block.number !== height)
+    )
+      throw new Error(
+        "flop: admission block is not on the anchor's chain at the expected height",
+      );
+    return block;
+  }
   private checkRef(ref: Reference): void {
     if (
       ref.network !== this.config.network ||
@@ -317,21 +385,26 @@ export class FlopRail implements SettlementRail {
     const anchor = await this.snapshot();
     if (Math.max(this.now(), anchor.timestampMs) >= terms.claimByMs)
       throw new Error("flop: claim window has closed");
+    // R10.2 reads the block that admits the open, which does not exist yet. The best block
+    // it will build on is the nearest there is; verifyLock re-evaluates R10.2 in the actual
+    // createdBlock, so this check can only refuse early.
+    const head = await this.admissionBlock(anchor);
     const ref: Reference = {
-      v: 1,
+      v: 2,
       network: this.config.network,
       genesis: anchor.genesis,
       escrow: `0x${"0".repeat(64)}`,
       anchor: anchor.hash,
       blockTimeMs: this.config.blockTimeMs,
       refundMarginBlocks: this.config.refundMarginBlocks,
+      symmetry: head.params,
       terms,
     };
     const deadlineBlocks = duration(ref, anchor);
     if (anchor.number + deadlineBlocks + ref.refundMarginBlocks > 0xffffffff)
       throw new Error("flop: deadline overflows chain height");
     // Before the duplicate guard and the journal: a refused lock leaves no trace.
-    if (this.config.symmetry) checkSymmetry(ref, anchor, this.config.symmetry);
+    admit(ref, anchor, head);
     // Check again after asynchronous preflight; preserve the guard on uncertain submission.
     if (this.submitted.has(terms.contract))
       throw new Error(
@@ -352,6 +425,9 @@ export class FlopRail implements SettlementRail {
         current.number - anchor.number >= ref.refundMarginBlocks
       )
         throw new Error("flop: anchor became stale before submission");
+      // Finality can fall behind while the journal runs: evaluate R10.2 again on the block
+      // the open will now build on, under the journaled parameters.
+      admit(ref, anchor, await this.admissionBlock(current));
     } catch (error) {
       this.submitted.delete(terms.contract);
       throw error;
@@ -414,8 +490,14 @@ export class FlopRail implements SettlementRail {
       const ref = parseRef(value);
       if (canonicalJson(ref.terms) !== canonicalJson(terms)) return false;
       const { snapshot, anchor, escrow } = await this.inspect(ref);
-      if (this.config.symmetry)
-        checkSymmetry(ref, anchor, this.config.symmetry);
+      // R10.2 in the block that admitted the open. The payer (at the end of lock) and the
+      // payee read the same finalized block under the parameters the reference binds, so
+      // they reach the same verdict, whatever the tip's finality lag when either checks.
+      admit(
+        ref,
+        anchor,
+        await this.admissionBlock(anchor, escrow.createdBlock),
+      );
       return (
         escrow.status === "Open" &&
         snapshot.finalizedNumber < escrow.deadline &&

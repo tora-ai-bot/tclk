@@ -23,6 +23,7 @@ export {
   flopAccountFromDid,
 } from "./rail.js";
 export type {
+  FlopAdmissionBlock,
   FlopChain,
   FlopSnapshot,
   FlopEscrow,
