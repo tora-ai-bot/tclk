@@ -22,15 +22,20 @@ All notable changes to this project are documented here. Format follows
   nominal millisecond conversion; chain stalls can delay refunds and changed block
   rates can shift the effective expiry. The client rechecks the claim window and
   anchor freshness after journaling, before submitting a lock.
-- `@flop-labs/tclk-flop`: an opt-in `symmetry` option that makes `FlopRail` apply the
-  yellow paper's R10.2 timelock-symmetry minimum,
-  `T_other + max(ceil(T_other * p / 100), max_finality_stall + current_finality_lag)`, as
-  an admission check: `lock` refuses before journaling or submitting, and `verifyLock`
-  returns `false`, when the submitted timeout is shorter. The parameters have no defaults
-  and must come from the live runtime; without the option nothing changes. It is a
-  testnet-only approximation (`claimByMs` stands in for the counter-chain duration,
-  measured from the finalized anchor at the nominal `blockTimeMs`), not mainnet
-  conformance. The pure `timelockSymmetryMinimum` helper is exported.
+- `@flop-labs/tclk-flop`: `FlopRail` admits every lock under the yellow paper's R10.2 rule
+  (v0.5.0 §10.1): the finality-open gate first, refusing when `current_finality_lag` is at
+  or above `finality_freeze_threshold`, then
+  `T_FLOP >= T_other + max(ceil(T_other * p / 100), max_finality_stall + current_finality_lag)`.
+  The three parameters are the runtime's `HasStation` constants, and the lag is read in the
+  admitting block: the best block for `lock`'s early refusal, the escrow's `createdBlock`
+  for `verifyLock`. `T_other` is the claim window in one-second blocks. References
+  (`flop2.`; earlier unreleased `flop1.` ones are refused) carry the parameters, the escrow
+  policy commits to them, and `verifyLock` requires them to equal the `createdBlock`'s
+  constants, so payer and payee evaluate the same inputs. `lock` throws
+  `FlopAdmissionError` before journaling or submitting; `claim` and `refund` are
+  unaffected. `FlopChain` gains `admissionBlock(height?)`. `claimByMs` standing in for the
+  counter-chain duration remains an approximation, and no mainnet conformance is claimed.
+  `checkTimelockSymmetry`, `timelockSymmetryMinimum` and `toOneSecondBlocks` are exported.
 - A schema-owned tclk/1 frame field contract, canonical settlement-rail registry and
   intersection-based, order-independent rail matching helpers. Generated decoder fields
   and the normative `SPEC.md` table are checked for drift in CI.
