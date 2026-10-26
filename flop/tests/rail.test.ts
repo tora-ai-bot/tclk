@@ -16,6 +16,7 @@ import {
   type FlopOpenRequest,
 } from "../src/rail.js";
 import { resolveFlopConfig } from "../src/config.js";
+import { FlopAdmissionError } from "../src/symmetry.js";
 const h = (n: number) => `0x${n.toString(16).padStart(64, "0")}`;
 const did = (n: number) =>
   `did:key:z${base58.encode(Uint8Array.from([0xed, 1, ...new Array(32).fill(n)]))}`;
@@ -141,36 +142,48 @@ describe("configuration", () => {
     expect(resolveFlopConfig({ symmetry: undefined })).not.toHaveProperty(
       "symmetry",
     );
-    const input = { marginPercent: 0, maxFinalityStallBlocks: 0 };
+    const input = {
+      marginPercent: 0,
+      maxFinalityStallBlocks: 0,
+      finalityFreezeThresholdBlocks: 1,
+    };
     const config = resolveFlopConfig({ symmetry: input });
     input.maxFinalityStallBlocks = 3_600;
     expect(config.symmetry).toEqual({
       marginPercent: 0,
       maxFinalityStallBlocks: 0,
+      finalityFreezeThresholdBlocks: 1,
     });
     expect(Object.isFrozen(config.symmetry)).toBe(true);
     // connectFlopRail hands the resolved config back to FlopRail.
     expect(resolveFlopConfig(config)).toEqual(config);
   });
+  const full = {
+    marginPercent: 20,
+    maxFinalityStallBlocks: 3_600,
+    finalityFreezeThresholdBlocks: 120,
+  };
   it.each([
     null,
     [],
     {},
     { marginPercent: 20 },
-    { maxFinalityStallBlocks: 3_600 },
-    { marginPercent: 20, maxFinalityStall: 3_600 },
-    { marginPercent: 20, maxFinalityStallBlocks: 3_600, extra: 1 },
-    { marginPercent: undefined, maxFinalityStallBlocks: 3_600 },
-    { marginPercent: NaN, maxFinalityStallBlocks: 3_600 },
-    { marginPercent: -1, maxFinalityStallBlocks: 3_600 },
-    { marginPercent: "20", maxFinalityStallBlocks: 3_600 },
-    { marginPercent: 20, maxFinalityStallBlocks: 1.5 },
-    { marginPercent: 20, maxFinalityStallBlocks: Infinity },
-    { marginPercent: 20, maxFinalityStallBlocks: 2 ** 32 },
+    { marginPercent: 20, maxFinalityStallBlocks: 3_600 },
+    { ...full, finalityFreezeThresholdBlocks: undefined },
+    { ...full, extra: 1 },
+    { marginPercent: 20, maxFinalityStall: 3_600, finalityFreezeThreshold: 120 },
+    { ...full, marginPercent: NaN },
+    { ...full, marginPercent: -1 },
+    { ...full, marginPercent: "20" },
+    { ...full, maxFinalityStallBlocks: 1.5 },
+    { ...full, maxFinalityStallBlocks: Infinity },
+    { ...full, finalityFreezeThresholdBlocks: 2 ** 32 },
   ])("rejects a malformed symmetry option %j", (symmetry) => {
-    expect(() => resolveFlopConfig({ symmetry } as any)).toThrow("symmetry");
+    expect(() => resolveFlopConfig({ symmetry } as any)).toThrow(
+      "R10.2 parameters",
+    );
     expect(() => new FlopRail(new Chain(), { symmetry } as any)).toThrow(
-      "symmetry",
+      "R10.2 parameters",
     );
   });
 });
@@ -597,8 +610,12 @@ describe("pending reference validation", () => {
 });
 
 describe("R10.2 timelock symmetry (opt-in)", () => {
-  // Test inputs only (yellow paper v0.5.0 Appendix A); the package ships no values.
-  const symmetry = { marginPercent: 20, maxFinalityStallBlocks: 3_600 };
+  // Test inputs only (the yellow paper v0.5.0 parameter table); the package ships no values.
+  const symmetry = {
+    marginPercent: 20,
+    maxFinalityStallBlocks: 3_600,
+    finalityFreezeThresholdBlocks: 120,
+  };
   // The anchor is height 100 at T0 with runtime finality prefix 99 (lag 1). With
   // claimByMs 3600 blocks out, R10.2 requires 3600 + max(720, 3600 + 1) = 7201.
   const withTimeout = (blocks: number): LockTerms => ({
@@ -652,25 +669,53 @@ describe("R10.2 timelock symmetry (opt-in)", () => {
     expect(await rail.verifyLock(t, await rail.lock(t))).toBe(true);
   });
 
-  it("converts claimByMs at the configured blockTimeMs, not at one block per second", async () => {
+  it("converts claimByMs to one-second blocks, whatever blockTimeMs is", async () => {
     const chain = new Chain();
     const rail = new FlopRail(
       chain,
       { blockTimeMs: 500, symmetry },
       clockOf(chain),
     );
-    // 1_800_000 ms is 3600 blocks at 500 ms; at one second it would be 1800, and
-    // 7200 blocks would clear the 5401 that would then be required.
+    // 1_800_000 ms is 1800 one-second blocks, as R10.2 converts it (3600 at the
+    // configured 500 ms). T_FLOP is the pallet timeout, still counted at 500 ms.
     const at500 = (blocks: number): LockTerms => ({
       ...terms(),
       claimByMs: T0 + 1_800_000,
       refundAfterMs: T0 + (blocks - 30) * 500,
     });
-    await expect(rail.lock(at500(7_200))).rejects.toThrow(
-      "7200 blocks offered, 7201 required (T_other 3600, finality lag 1)",
+    await expect(rail.lock(at500(5_400))).rejects.toThrow(
+      "5400 blocks offered, 5401 required (T_other 1800, finality lag 1)",
     );
-    const t = at500(7_201);
+    const t = at500(5_401);
     expect(await rail.verifyLock(t, await rail.lock(t))).toBe(true);
+  });
+
+  it("applies the finality-open gate before the relation: refused at the threshold, admitted below", async () => {
+    const lagged = (lag: number) => {
+      const chain = new Chain();
+      Object.assign(chain.head, {
+        number: 1_000,
+        finalizedNumber: 1_000 - lag,
+        hash: h(1_000),
+      });
+      chain.history.set(chain.head.hash, structuredClone(chain.head));
+      return { chain, rail: new FlopRail(chain, { symmetry }, clockOf(chain)) };
+    };
+    const frozen = lagged(120);
+    // Long enough for any lag: only the gate refuses it, and nothing is sent.
+    const error = await frozen.rail.lock(withTimeout(20_000)).catch((e) => e);
+    expect(error).toBeInstanceOf(FlopAdmissionError);
+    expect(error).toMatchObject({ reason: "finality-freeze" });
+    expect(error.message).toContain(
+      "finality lag 120 is at or above the R10.2 freeze threshold 120",
+    );
+    expect(frozen.chain.opens).toBe(0);
+    const open = lagged(119);
+    await expect(open.rail.lock(withTimeout(7_318))).rejects.toThrow(
+      "7318 blocks offered, 7319 required (T_other 3600, finality lag 119)",
+    );
+    const t = withTimeout(7_319);
+    expect(await open.rail.verifyLock(t, await open.rail.lock(t))).toBe(true);
   });
 
   it("makes the payee's verifyLock refuse a short escrow, while claim and refund ignore the option", async () => {

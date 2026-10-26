@@ -16,7 +16,8 @@ import {
   type FlopNetwork,
 } from "./config.js";
 import {
-  timelockSymmetryMinimum,
+  checkTimelockSymmetry,
+  toOneSecondBlocks,
   type FlopSymmetryParams,
 } from "./symmetry.js";
 
@@ -191,27 +192,25 @@ function duration(ref: Reference, anchor: FlopSnapshot): number {
 }
 /**
  * Opt-in R10.2 admission check, derived from the finalized anchor alone so the payer's
- * lock and the payee's verifyLock reach the same verdict. T_FLOP is the relative timeout
- * submitted to the pallet; T_other is the anchor-to-claimByMs span at the agreed
- * blockTimeMs; current_finality_lag is the anchor height minus its runtime finality
- * prefix. Testnet-only approximation: tclk has no counter-chain leg, so claimByMs stands
- * in for T_other, and this claims no mainnet R10.2 conformance (see README).
+ * lock and the payee's verifyLock reach the same verdict. The finality-open gate runs
+ * first, then the relation. T_FLOP is the relative timeout submitted to the pallet;
+ * T_other is the anchor-to-claimByMs span in one-second blocks, as R10.2 converts it,
+ * whatever blockTimeMs is; current_finality_lag is the anchor height minus its runtime
+ * finality prefix. Testnet-only approximation: tclk has no counter-chain leg, so
+ * claimByMs stands in for T_other, and this claims no mainnet R10.2 conformance (see
+ * README).
  */
 function checkSymmetry(
   ref: Reference,
   anchor: FlopSnapshot,
   params: FlopSymmetryParams,
 ): void {
-  const tOther = Math.ceil(
-    (ref.terms.claimByMs - anchor.timestampMs) / ref.blockTimeMs,
-  );
-  const lag = anchor.number - anchor.finalizedNumber;
-  const offered = duration(ref, anchor);
-  const required = timelockSymmetryMinimum(tOther, params, lag);
-  if (offered < required)
-    throw new Error(
-      `flop: timeout below the R10.2 symmetry minimum: ${offered} blocks offered, ${required} required (T_other ${tOther}, finality lag ${lag})`,
-    );
+  checkTimelockSymmetry({
+    tFlopBlocks: duration(ref, anchor),
+    tOtherBlocks: toOneSecondBlocks(ref.terms.claimByMs - anchor.timestampMs),
+    currentFinalityLagBlocks: anchor.number - anchor.finalizedNumber,
+    params,
+  });
 }
 function checkSnapshot(s: FlopSnapshot): void {
   if (

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import type { FlopSymmetryParams } from "./symmetry.js";
+import { checkSymmetryParams, type FlopSymmetryParams } from "./symmetry.js";
 export type FlopNetwork = "devnet" | "testnet" | "mainnet";
 export interface FlopRailConfig {
   network?: FlopNetwork;
@@ -11,9 +11,10 @@ export interface FlopRailConfig {
   /** Extra blocks before refund; also bounds lock-inclusion delay. */
   refundMarginBlocks?: number;
   /**
-   * Opt-in R10.2 timelock-symmetry admission check, with values read from the live
-   * runtime. No default: absent, no check runs. A testnet-only approximation
-   * (claimByMs stands in for the counter-chain duration), not mainnet conformance.
+   * Opt-in R10.2 admission check (the finality-open gate, then the timelock-symmetry
+   * margin), with all three values read from the live runtime. No default: absent, no
+   * check runs. A testnet-only approximation (claimByMs stands in for the counter-chain
+   * duration), not mainnet conformance.
    */
   symmetry?: FlopSymmetryParams;
 }
@@ -67,27 +68,11 @@ export function resolveFlopConfig(
       throw new Error(`flop: invalid ${field}`);
     }
   }
-  let symmetry: Readonly<FlopSymmetryParams> | undefined;
-  if (input.symmetry !== undefined) {
-    const s = input.symmetry;
-    // Exact fields: a misspelt parameter must not leave the check half-configured.
-    if (
-      typeof s !== "object" ||
-      s === null ||
-      Object.keys(s).sort().join() !== "marginPercent,maxFinalityStallBlocks"
-    )
-      throw new Error("flop: invalid symmetry");
-    const { marginPercent, maxFinalityStallBlocks } = s;
-    for (const [field, value] of Object.entries({
-      marginPercent,
-      maxFinalityStallBlocks,
-    })) {
-      if (!Number.isSafeInteger(value) || value < 0 || value > 0xffffffff) {
-        throw new Error(`flop: invalid symmetry.${field}`);
-      }
-    }
-    symmetry = Object.freeze({ marginPercent, maxFinalityStallBlocks });
-  }
+  // Exact fields: a misspelt parameter must not leave the check half-configured.
+  const symmetry =
+    input.symmetry === undefined
+      ? undefined
+      : checkSymmetryParams(input.symmetry);
   return Object.freeze({
     network,
     rpcUrl,
