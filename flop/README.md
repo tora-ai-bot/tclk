@@ -93,7 +93,9 @@ The versioned `flop2.` reference encodes public terms, network/genesis, the
 escrow ID, a finalized anchor block hash, the agreed timing profile and the R10.2
 parameters the open was admitted under. It contains no private key or claim
 secret. It remains usable in another process. `flop1.` references, from earlier
-unreleased builds, carry no R10.2 parameters and are refused.
+unreleased builds, carry no R10.2 parameters and are refused. As of 2026-10-28 (devnet
+finalized #2,285,869) no `flop1.` escrow was open on devnet: the 14 that existed were
+settled (6 released, 8 refunded), and testnet and mainnet were not live.
 The escrow policy is exactly:
 
 ```

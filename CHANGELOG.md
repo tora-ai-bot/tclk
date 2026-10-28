@@ -36,6 +36,9 @@ All notable changes to this project are documented here. Format follows
   unaffected. `FlopChain` gains `admissionBlock(height?)`. `claimByMs` standing in for the
   counter-chain duration remains an approximation, and no mainnet conformance is claimed.
   `checkTimelockSymmetry`, `timelockSymmetryMinimum` and `toOneSecondBlocks` are exported.
+  Checked 2026-10-28: no `flop1.` escrow was open on devnet (finalized #2,285,869; the 14
+  that existed were settled) and testnet/mainnet were not live, so refusing `flop1.`
+  references, including for refund, strands nothing (#171).
 - A schema-owned tclk/1 frame field contract, canonical settlement-rail registry and
   intersection-based, order-independent rail matching helpers. Generated decoder fields
   and the normative `SPEC.md` table are checked for drift in CI.
