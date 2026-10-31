@@ -2,18 +2,25 @@
  * The frames in examples/htlc-walkthrough.md are real, not illustrative: every
  * `FRAME='tclk1 …'` line decodes, the ids are the ones the library computes, and the
  * transcript folds to `claimed` on the reveal path and `refunded` on the alternative.
+ * Each `from` is the did:key of a real (throwaway) Ed25519 key pair, so the same lines
+ * also fold as signed technocore records, the way a reader of the rooms checks them.
  * Its MCP section calls each tool with the arguments that tool's schema takes, and posts
  * each frame in the room a fold expects it in. Pinning that here keeps the walkthrough
  * from drifting from the code it demonstrates.
  */
 
 import { readFileSync } from "node:fs";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { base58, base64urlnopad } from "@scure/base";
 import { describe, it, expect } from "vitest";
 
 import {
   OFFER_ROOM,
   applyFrame,
+  dealRoom,
   decodeFrame,
+  foldTranscript,
   hashLockFromPreimage,
   openContract,
   type AcceptFrame,
@@ -21,6 +28,7 @@ import {
   type OfferFrame,
   type RefundFrame,
   type RevealFrame,
+  type TranscriptRecord,
 } from "../src/index.js";
 // The tool catalogue exactly as an MCP client is served it, generated from mcp/src/server.ts;
 // mcp/worker/tests/manifest.test.ts fails if the two drift.
@@ -42,6 +50,21 @@ const mcpCalls = [...markdown.matchAll(/`(tclk_[a-z_]+)`\s+`(\{[^`]*\})`/g)].map
 // shape an edit breaks (a comma or a word between the two) then fails the test below instead
 // of dropping out of the schema and room checks unnoticed.
 const argumentSpans = [...markdown.matchAll(/`(\{[^`]*\})`/g)].map((m) => m[1]);
+
+// The two parties: throwaway Ed25519 key pairs made for the walkthrough. Their seeds are
+// public (the sha256 of a label the prose names), so the DIDs are real did:keys that nobody
+// owns: `did:key:z` + base58btc(0xed 0x01 || public key), as the signed lane verifies them.
+function identity(label: string) {
+  const seed = sha256(new TextEncoder().encode(label));
+  const publicKey = ed25519.getPublicKey(seed);
+  return {
+    did: `did:key:z${base58.encode(Uint8Array.from([0xed, 0x01, ...publicKey]))}`,
+    sign: (canonical: string) =>
+      base64urlnopad.encode(ed25519.sign(new TextEncoder().encode(canonical), seed)),
+  };
+}
+const payer = identity("tclk walkthrough payer");
+const payee = identity("tclk walkthrough payee");
 
 describe("examples/htlc-walkthrough.md", () => {
   it("carries five frames that all decode, in walkthrough order", () => {
@@ -71,6 +94,47 @@ describe("examples/htlc-walkthrough.md", () => {
     const refunded = applyFrame(locked.state, decodeFrame(refundLine), offer.refundAfterMs);
     expect(refunded.ok).toBe(true);
     expect(refunded.state.status).toBe("refunded");
+  });
+
+  it("names the two throwaway key pairs as `from`, and the prose names their seeds", () => {
+    expect(lines.map((line) => decodeFrame(line).from)).toEqual([
+      payer.did, payee.did, payer.did, payee.did, payer.did,
+    ]);
+    expect(markdown).toContain("`tclk walkthrough payer`");
+    expect(markdown).toContain("`tclk walkthrough payee`");
+  });
+
+  it("folds as signed records, offer and accept on the board and the rest in the deal room", () => {
+    const [offerLine, acceptLine, lockLine, revealLine, refundLine] = lines;
+    const offer = decodeFrame(offerLine) as OfferFrame;
+    const room = dealRoom((decodeFrame(acceptLine) as AcceptFrame).contract);
+    // Each side posts its own frames, signed over `<room>|<nonce>|<line>`; the fold checks
+    // the signature against the sender's did:key and the frame's `from` against the sender.
+    // seq and timestamp are venue metadata.
+    const record = (
+      seq: number, inRoom: string, timestampMs: number, by: typeof payer, line: string,
+    ): TranscriptRecord => {
+      const nonce = String(seq);
+      const signature = by.sign(`${inRoom}|${nonce}|${line}`);
+      return { room: inRoom, seq, timestampMs, sender: by.did, nonce, signature, line };
+    };
+    const opening = [
+      record(1, OFFER_ROOM, offer.expiresMs - 60_000, payer, offerLine),
+      record(2, OFFER_ROOM, offer.expiresMs - 1, payee, acceptLine),
+      record(3, room, offer.expiresMs, payer, lockLine),
+    ];
+
+    const claimed = foldTranscript([
+      ...opening, record(4, room, offer.refundAfterMs - 1, payee, revealLine),
+    ]);
+    expect(claimed.steps.filter((step) => !step.ok)).toEqual([]);
+    expect(claimed.state?.status).toBe("claimed");
+
+    const refunded = foldTranscript([
+      ...opening, record(4, room, offer.refundAfterMs, payer, refundLine),
+    ]);
+    expect(refunded.steps.filter((step) => !step.ok)).toEqual([]);
+    expect(refunded.state?.status).toBe("refunded");
   });
 
   it("reveals the stand-in preimage the prose describes, and it opens the statement", () => {
